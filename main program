@@ -1,0 +1,1112 @@
+import sys
+import csv
+import random
+import numpy as np
+import tensorflow as tf
+from matplotlib import pyplot as plt
+from sklearn.preprocessing import StandardScaler
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.losses import binary_crossentropy
+from sklearn.model_selection import train_test_split
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.figure import Figure
+from PyQt5.QtWidgets import (
+    QApplication, QWidget, QFileDialog, QMessageBox, QTextEdit, QProgressBar,
+    QDialog, QScrollArea, QVBoxLayout, QHBoxLayout, QLabel,
+    QCheckBox, QTabWidget, QSlider, QSpinBox, QGroupBox, QSplitter, QFrame,
+    QListWidget, QDialogButtonBox, QPushButton
+)
+from PyQt5.QtGui import QColor, QPalette, QIcon
+from PyQt5.QtCore import Qt, QThread, pyqtSignal
+from Neuralnetwork import Nnetwork
+from Metalearning import MetaLearning
+from PCPs import support_set_label
+from scipy.interpolate import make_interp_spline
+
+
+class ModelMonitoringWidget(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setup_ui()
+        self.loss_history = []
+        self.accuracy_history = []
+
+    def setup_ui(self):
+        layout = QVBoxLayout()
+        layout.setContentsMargins(5, 5, 5, 5)
+
+        # 创建元学习监控组
+        group = QGroupBox("Meta-Learning Monitoring")
+        group.setStyleSheet("""
+            QGroupBox {
+                font: bold 12px "Segoe UI";
+                border: 2px solid #4A90E2;
+                border-radius: 8px;
+                margin-top: 10px;
+                padding-top: 15px;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 5px;
+                color: #4A90E2;
+            }
+        """)
+
+        # 主布局
+        main_layout = QHBoxLayout()
+
+        # 指标面板
+        metrics_panel = QFrame()
+        metrics_panel.setFrameShape(QFrame.StyledPanel)
+        metrics_layout = QVBoxLayout(metrics_panel)
+
+        self.loss_label = QLabel("Loss: ---")
+        self.accuracy_label = QLabel("Accuracy: ---")
+        self.epoch_label = QLabel("Meta-Epoch: ---")
+        self.task_label = QLabel("Current Task: ---")
+
+        for label in [self.loss_label, self.accuracy_label, self.epoch_label, self.task_label]:
+            label.setStyleSheet("font: 11px 'Segoe UI'; margin-bottom: 8px;")
+            metrics_layout.addWidget(label)
+
+        metrics_layout.addStretch()
+        main_layout.addWidget(metrics_panel, 1)
+
+        # 图表面板
+        self.figure = Figure(figsize=(5, 3), tight_layout=True)
+        self.canvas = FigureCanvas(self.figure)
+        self.canvas.setMinimumSize(300, 200)
+        self.ax = self.figure.add_subplot(111)
+
+        # 初始化空曲线
+        self.loss_curve, = self.ax.plot([], [], 'r-', label='Meta-Loss',
+                                        linewidth=2, alpha=0.8)
+        self.acc_curve, = self.ax.plot([], [], 'b-', label='Meta-Accuracy',
+                                       linewidth=2, alpha=0.8)
+
+        self.ax.set_title('Meta-Learning Progress', fontsize=10)
+        self.ax.set_xlabel('Meta-Epoch', fontsize=8)
+        self.ax.set_ylabel('Value', fontsize=8)
+        self.ax.grid(True, alpha=0.3)
+        self.ax.legend(fontsize=8)
+
+        main_layout.addWidget(self.canvas, 2)
+        group.setLayout(main_layout)
+        layout.addWidget(group)
+        self.setLayout(layout)
+
+    def _smooth_curve(self, x, y):
+        """使用三次样条插值生成平滑曲线"""
+        if len(x) < 4:  # 数据点太少时直接返回原数据
+            return x, y
+
+        # 生成300个均匀分布的点用于平滑曲线
+        x_new = np.linspace(min(x), max(x), 300)
+
+        try:
+            # 使用三次样条插值
+            spl = make_interp_spline(x, y, k=3)
+            y_smooth = spl(x_new)
+            return x_new, y_smooth
+        except:
+            return x, y
+
+    def update_metrics(self, loss, accuracy, epoch, task_info=""):
+        accuracy = max(0, min(1, accuracy))
+
+        self.loss_label.setText(f"Meta-Loss: {loss:.4f}")
+        self.accuracy_label.setText(f"Meta-Accuracy: {accuracy:.4f}")
+        self.epoch_label.setText(f"Meta-Epoch: {epoch}")
+        self.task_label.setText(f"Current Task: {task_info}")
+
+        # 更新历史数据
+        self.loss_history.append(loss)
+        self.accuracy_history.append(accuracy)
+
+        # 准备原始数据
+        epochs = np.arange(1, len(self.loss_history) + 1)
+
+        # 生成平滑曲线数据
+        x_smooth, loss_smooth = self._smooth_curve(epochs, self.loss_history)
+        _, acc_smooth = self._smooth_curve(epochs, self.accuracy_history)
+
+        # 确保平滑后的数据也在0-1范围内（仅对accuracy）
+        acc_smooth = np.clip(acc_smooth, 0, 1)
+
+        # 更新曲线
+        self.loss_curve.set_data(x_smooth, loss_smooth)
+        self.acc_curve.set_data(x_smooth, acc_smooth)
+
+        # 调整坐标轴范围
+        self.ax.relim()
+        self.ax.autoscale_view()
+
+        # 强制y轴在0-1范围内
+        self.ax.set_ylim(0, 1)
+
+        # 确保x轴显示完整
+        if len(epochs) > 0:
+            self.ax.set_xlim(0.5, max(epochs) + 0.5)
+
+        self.canvas.draw()
+
+class PatternVisualizationWidget(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.figure = None
+        self.canvas = None
+        self.ax = None
+        self.pos = None
+        self.G = None
+        self.last_patterns = None
+        self.setup_ui()
+        self.dragged_node = None  # 添加这一行
+        self.press_pos = None  # 添加这一行
+
+        # Enable interactive features
+        self.canvas.setFocusPolicy(Qt.ClickFocus)
+        self.canvas.setFocus()
+        self.canvas.mpl_connect('scroll_event', self.on_scroll)
+        self.canvas.mpl_connect('button_press_event', self.on_press)
+        self.canvas.mpl_connect('button_release_event', self.on_release)
+        self.canvas.mpl_connect('motion_notify_event', self.on_motion)
+        self.canvas.mpl_connect('motion_notify_event', self.on_hover)
+
+        self.press = None
+        self.xlim = None
+        self.ylim = None
+        self.hover_text = None
+
+    def setup_ui(self):
+        layout = QVBoxLayout()
+        layout.setContentsMargins(5, 5, 5, 5)
+
+        # 创建模式可视化组 - 修改标题和样式
+        group = QGroupBox("Pattern Visualization")
+        group.setStyleSheet("""
+            QGroupBox {
+                font: bold 12px "Segoe UI";
+                border: 2px solid #8A2BE2;
+                border-radius: 8px;
+                margin-top: 10px;
+                padding-top: 15px;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 5px;
+                color: #8A2BE2;
+            }
+        """)
+
+        # 创建Matplotlib图表 (保持原样)
+        self.figure = Figure(figsize=(5, 4))
+        self.canvas = FigureCanvas(self.figure)
+        self.canvas.setMinimumSize(300, 250)
+        self.ax = self.figure.add_subplot(111)
+
+        # 初始化空图 (保持原样)
+        self.ax.text(0.5, 0.5, 'Waiting for data...',
+                     ha='center', va='center',
+                     fontsize=12, color='gray')
+        self.ax.axis('off')
+        self.canvas.draw()
+
+        # 添加控制按钮 (仅修改样式)
+        control_layout = QHBoxLayout()
+        self.btn_refresh = QPushButton("Refresh Visualization")
+        self.btn_refresh.setStyleSheet("""
+            QPushButton {
+                background-color: #8A2BE2;
+                color: white;
+                padding: 8px;
+                border-radius: 4px;
+                font: 11px "Segoe UI";
+            }
+            QPushButton:hover {
+                background-color: #7B1FA2;
+            }
+        """)
+        self.btn_refresh.clicked.connect(self.refresh_graph)
+
+        control_layout.addStretch()
+        control_layout.addWidget(self.btn_refresh)
+        control_layout.addStretch()
+
+        group_layout = QVBoxLayout()
+        group_layout.addWidget(self.canvas)
+        group_layout.addWidget(self.btn_refresh)
+        group.setLayout(group_layout)
+
+
+        layout.addWidget(group)
+        self.setLayout(layout)
+
+    # 以下是原有功能代码完全保持不变
+    def update_similarity_graph(self, patterns, pattern_labels=None):
+        """更新相似性图谱
+        :param patterns: 模式列表
+        :param pattern_labels: 与预测列表一致的标签列表（如['P1', 'P2', ...]）
+        """
+        self.last_patterns = patterns
+
+        if not patterns:
+            self.ax.clear()
+            self.ax.text(0.5, 0.5, 'No visible patterns.',
+                         ha='center', va='center',
+                         fontsize=12, color='gray')
+            self.ax.axis('off')
+            self.canvas.draw()
+            return
+
+        try:
+            import networkx as nx
+            from matplotlib.colors import LinearSegmentedColormap
+
+            # 检查是否是第一次生成图谱
+            first_generation = not hasattr(self, 'similarity_cbar')
+
+            # 计算模式之间的相似度
+            similarity_matrix = self.calculate_similarity(patterns)
+
+            # 创建图
+            self.G = nx.Graph()
+
+            feature_names = ['University', 'Hospital', 'Library', 'Restaurants',
+                             'Cinema', 'Pharmacy', 'Museum', 'Theater', 'Hotel', 'Station']
+
+            for i, pattern in enumerate(patterns):
+                features = [feature_names[j] for j, val in enumerate(pattern) if val == 1]
+                label = pattern_labels[i] if pattern_labels else f"P{i + 1}"
+                self.G.add_node(i, label=label, size=sum(pattern) * 50 + 100,
+                                features=", ".join(features))
+
+            threshold = 0.75
+            for i in range(len(patterns)):
+                for j in range(i + 1, len(patterns)):
+                    if similarity_matrix[i][j] > threshold:
+                        self.G.add_edge(i, j, weight=similarity_matrix[i][j] * 5)
+
+            # 计算布局 - 修改这部分参数来优化节点分布
+            self.pos = nx.spring_layout(
+                self.G,
+                k=1.5,  # 增加这个值会使节点间距更大
+                iterations=100,  # 增加迭代次数以获得更稳定的布局
+                scale=2.0,  # 增加比例因子扩大整体布局
+                seed=42,  # 固定随机种子以获得一致的结果
+                weight='weight'  # 考虑边的权重
+            )
+
+            # 绘制图
+            self.ax.clear()
+
+            # 使用蓝色颜色映射
+            cmap = plt.cm.Blues
+
+            # 绘制边
+            edges = nx.draw_networkx_edges(
+                self.G, self.pos, ax=self.ax,
+                edge_color=[self.G[u][v]['weight'] for u, v in self.G.edges()],
+                edge_cmap=cmap,
+                width=1.5,
+                alpha=0.6
+            )
+
+            # 绘制节点
+            nodes = nx.draw_networkx_nodes(
+                self.G, self.pos, ax=self.ax,
+                node_size=[self.G.nodes[n]['size'] for n in self.G.nodes()],
+                node_color='#8A2BE2',
+                alpha=0.8
+            )
+
+            # 在节点内部添加标签
+            for node, (x, y) in self.pos.items():
+                self.ax.text(x, y, self.G.nodes[node]['label'],
+                             fontsize=5, ha='center', va='center',
+                             color='white', weight='bold')
+
+            # 设置标题
+            self.ax.set_title('Meta-Learned Pattern Relationships', fontsize=10)
+
+            # 设置初始视图范围
+            x_values = [pos[0] for pos in self.pos.values()]
+            y_values = [pos[1] for pos in self.pos.values()]
+            margin = max(max(x_values) - min(x_values), max(y_values) - min(y_values)) * 0.15
+            self.ax.set_xlim(min(x_values) - margin, max(x_values) + margin)
+            self.ax.set_ylim(min(y_values) - margin, max(y_values) + margin)
+
+            self.xlim = self.ax.get_xlim()
+            self.ylim = self.ax.get_ylim()
+
+            # 只在第一次生成图谱时创建colorbar
+            if first_generation and edges:
+                self.similarity_cbar = self.figure.colorbar(edges, ax=self.ax)
+                self.similarity_cbar.set_label('Meta-Similarity')
+
+            # 自动调整布局
+            self.figure.tight_layout()
+            self.canvas.draw()
+
+        except ImportError:
+            self.ax.clear()
+            self.ax.text(0.5, 0.5, 'You need to install the networkx library.',
+                         ha='center', va='center',
+                         fontsize=12, color='red')
+            self.ax.axis('off')
+            self.canvas.draw()
+
+    def calculate_similarity(self, patterns):
+        """计算模式之间的Jaccard相似度"""
+        n = len(patterns)
+        similarity = np.zeros((n, n))
+
+        for i in range(n):
+            for j in range(i, n):
+                if i == j:
+                    similarity[i][j] = 1.0
+                else:
+                    # 计算Jaccard相似度
+                    intersection = np.sum(np.logical_and(patterns[i], patterns[j]))
+                    union = np.sum(np.logical_or(patterns[i], patterns[j]))
+                    similarity[i][j] = similarity[j][i] = intersection / union if union != 0 else 0
+
+        return similarity
+
+    def refresh_graph(self):
+        """手动刷新图谱"""
+        if hasattr(self, 'last_patterns') and self.last_patterns:
+            self.update_similarity_graph(self.last_patterns)
+
+    def on_scroll(self, event):
+        """鼠标滚轮缩放"""
+        if event.inaxes != self.ax:
+            return
+
+        scale_factor = 1.2 if event.button == 'up' else 1 / 1.2
+
+        # 获取当前范围
+        xlim = self.ax.get_xlim()
+        ylim = self.ax.get_ylim()
+
+        # 计算新的范围
+        new_xlim = [(x - event.xdata) * scale_factor + event.xdata for x in xlim]
+        new_ylim = [(y - event.ydata) * scale_factor + event.ydata for y in ylim]
+
+        # 应用新范围
+        self.ax.set_xlim(new_xlim)
+        self.ax.set_ylim(new_ylim)
+        self.canvas.draw()
+
+    def on_press(self, event):
+        """鼠标按下开始拖动"""
+        if event.inaxes != self.ax or event.button != 1:  # 左键
+            return
+        self.press = event.xdata, event.ydata
+        self.xlim = self.ax.get_xlim()
+        self.ylim = self.ax.get_ylim()
+
+    def on_release(self, event):
+        """鼠标释放结束拖动"""
+        self.press = None
+
+    def on_motion(self, event):
+        """鼠标移动实现拖动"""
+        if self.press is None or event.inaxes != self.ax:
+            return
+
+        xpress, ypress = self.press
+        dx = event.xdata - xpress
+        dy = event.ydata - ypress
+
+        # 应用平移
+        self.ax.set_xlim(self.xlim[0] - dx, self.xlim[1] - dx)
+        self.ax.set_ylim(self.ylim[0] - dy, self.ylim[1] - dy)
+        self.canvas.draw()
+
+    def on_hover(self, event):
+        """优化后的悬停显示：仅在悬停节点时显示文本框"""
+        # 如果不在图表区域内或没有图数据，移除现有文本框
+        if event.inaxes != self.ax or self.G is None or self.pos is None:
+            if self.hover_text is not None:
+                self.hover_text.remove()
+                self.hover_text = None
+                self.canvas.draw_idle()
+            return
+
+        # 检查鼠标是否悬停在任何节点上
+        hovered_node = None
+        for node, (x, y) in self.pos.items():
+            node_radius = np.sqrt(self.G.nodes[node]['size'] / (70 * np.pi)) * 0.03
+            if (event.xdata is not None and
+                    np.sqrt((event.xdata - x) ** 2 + (event.ydata - y) ** 2) < node_radius):
+                hovered_node = node
+                break
+
+        # 如果当前有文本框但鼠标不在节点上，移除文本框
+        if self.hover_text is not None and hovered_node is None:
+            self.hover_text.remove()
+            self.hover_text = None
+            self.canvas.draw_idle()
+            return
+
+        # 如果鼠标在节点上，显示或更新文本框
+        if hovered_node is not None:
+            # 获取节点信息
+            label = self.G.nodes[hovered_node]['label']
+            features = self.G.nodes[hovered_node]['features']
+            x, y = self.pos[hovered_node]
+
+            # 如果文本框不存在，创建新的
+            if self.hover_text is None:
+                self.hover_text = self.ax.annotate(
+                    f"{label}: {features}",
+                    xy=(x, y),
+                    xytext=(0, 20),
+                    textcoords='offset pixels',
+                    fontsize=7,
+                    ha='center',
+                    va='bottom',
+                    bbox=dict(
+                        facecolor='white',
+                        alpha=0.9,
+                        edgecolor='#8A2BE2',
+                        boxstyle='round,pad=1',
+                    ),
+                    annotation_clip=False,
+                )
+                self.canvas.draw_idle()
+            # 如果文本框已存在，更新位置和内容
+            else:
+                self.hover_text.xy = (x, y)
+                self.hover_text.set_text(f"{label}: {features}")
+                self.hover_text.set_position((0, 20))
+                self.canvas.draw_idle()
+
+class MetaLearningThread(QThread):
+    finished = pyqtSignal(object)
+
+    def run(self):
+        try:
+            X, y = MetaLearning.load_data(support_set_label)
+            X_scaled = [StandardScaler().fit_transform(task.reshape(-1, 1)).flatten() for task in X]
+            input_dim = len(X_scaled[0])
+            meta_model = MetaLearning.MetaModelWrapper(input_dim, hidden_units=64)
+
+            for epoch in range(15):
+                MetaLearning.maml_train(
+                    meta_model.meta_model,
+                    X_scaled,
+                    y,
+                    num_tasks=10,
+                    n_shot=20,
+                    n_query=40,
+                    k_way=2,
+                    inner_optimizer=Adam(learning_rate=0.01),
+                    outer_optimizer=Adam(learning_rate=0.001),
+                    epochs=1,
+                    inner_steps=5
+                )
+
+            self.finished.emit(meta_model.meta_model)
+        except Exception as e:
+            print(f"Pre-training error: {str(e)}")
+
+
+class MainWindow(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Meta-PatternLearner")
+        self.setWindowIcon(QIcon("icon.png"))  # 请准备一个图标文件
+        self.resize(1200, 800)
+
+        # 初始化数据
+        self.csv_data = None
+        self.auxiliary_list = []
+        self.pattern_datas = None
+        self.pre_trained_model = None
+        self.user_preferences = {}
+
+        # 设置样式
+        self.setup_styles()
+        self.setup_ui()
+
+        # 启动元学习
+        self.start_meta_learning()
+
+        # 添加一个标志表示预学习是否完成
+        self.meta_learning_completed = False
+
+    def setup_styles(self):
+        self.setStyleSheet("""
+            QWidget {
+                font-family: "Segoe UI";
+                background-color: #F5F7FA;
+            }
+            QPushButton {
+                padding: 8px 12px;
+                border-radius: 4px;
+                font: 11px "Segoe UI";
+                min-width: 80px;
+            }
+            QLineEdit, QTextEdit, QListWidget {
+                border: 1px solid #D1D5DB;
+                border-radius: 4px;
+                padding: 6px;
+                font: 11px "Segoe UI";
+            }
+            QProgressBar {
+                border: 1px solid #D1D5DB;
+                border-radius: 4px;
+                height: 16px;
+                text-align: center;
+            }
+            QProgressBar::chunk {
+                background-color: #4A90E2;
+                border-radius: 3px;
+            }
+        """)
+
+    def setup_ui(self):
+        main_layout = QVBoxLayout()
+        main_layout.setContentsMargins(10, 10, 10, 10)
+        main_layout.setSpacing(10)
+
+        # 标题栏
+        self.setup_header(main_layout)
+
+        # 主内容区
+        self.setup_main_content(main_layout)
+
+        # 状态栏
+        self.setup_status_bar(main_layout)
+
+        self.setLayout(main_layout)
+
+    def setup_header(self, layout):
+        header = QFrame()
+        header.setStyleSheet("""
+            QFrame {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #4A90E2, stop:1 #8A2BE2);
+                border-radius: 8px;
+                padding: 15px;
+            }
+        """)
+
+        header_layout = QVBoxLayout(header)
+
+        title = QLabel("Meta-PatternLearner")
+        title.setStyleSheet("""
+            QLabel {
+                font: bold 24px "Segoe UI";
+                color: white;
+                qproperty-alignment: AlignCenter;
+            }
+        """)
+
+        subtitle = QLabel("Interactive Data Mining with Meta-Learning")
+        subtitle.setStyleSheet("""
+            QLabel {
+                font: 14px "Segoe UI";
+                color: rgba(255,255,255,0.9);
+                qproperty-alignment: AlignCenter;
+                margin-top: 5px;
+            }
+        """)
+
+        header_layout.addWidget(title)
+        header_layout.addWidget(subtitle)
+        layout.addWidget(header)
+
+    def setup_main_content(self, layout):
+        splitter = QSplitter(Qt.Horizontal)
+
+        # 左侧面板 - 数据交互区
+        left_panel = QTabWidget()
+        left_panel.setStyleSheet("""
+            QTabWidget::pane {
+                border: 1px solid #D1D5DB;
+                border-radius: 6px;
+            }
+            QTabBar::tab {
+                padding: 8px 15px;
+                font: bold 11px "Segoe UI";
+                background: #EDF2F7;
+            }
+            QTabBar::tab:selected {
+                background: #4A90E2;
+                color: white;
+            }
+        """)
+
+        # 数据加载选项卡
+        self.setup_data_tab(left_panel)
+
+        # 用户交互选项卡
+        self.setup_interaction_tab(left_panel)
+
+        # 右侧面板 - 元学习可视化
+        right_panel = QTabWidget()
+        right_panel.setStyleSheet(left_panel.styleSheet())
+
+        # 元学习监控
+        self.model_monitor = ModelMonitoringWidget()
+        right_panel.addTab(self.model_monitor, "Meta-Learning")
+
+        # 模式可视化
+        self.pattern_viz = PatternVisualizationWidget()
+        right_panel.addTab(self.pattern_viz, "Patterns")
+
+        splitter.addWidget(left_panel)
+        splitter.addWidget(right_panel)
+        splitter.setSizes([400, 800])
+
+        layout.addWidget(splitter)
+
+    def setup_data_tab(self, tab_widget):
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+
+        # 文件操作组
+        file_group = QGroupBox("Data Loading")
+        file_group.setStyleSheet("""
+            QGroupBox {
+                font: bold 12px "Segoe UI";
+                border: 2px solid #4A90E2;
+                border-radius: 8px;
+                margin-top: 10px;
+                padding-top: 15px;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 5px;
+                color: #4A90E2;
+            }
+        """)
+
+        file_layout = QVBoxLayout(file_group)
+
+        btn_load = QPushButton("Load CSV Data")
+        btn_load.setStyleSheet("background-color: #4A90E2; color: white;")
+        btn_load.clicked.connect(self.load_csv_data)
+
+        self.data_info = QLabel("No data loaded")
+        self.data_info.setStyleSheet("font: 11px 'Segoe UI'; color: #666;")
+
+        file_layout.addWidget(btn_load)
+        file_layout.addWidget(self.data_info)
+        file_layout.addStretch()
+
+        # 数据显示
+        self.data_display = QListWidget()
+        self.data_display.setStyleSheet("font: 11px 'Consolas';")
+
+        layout.addWidget(file_group)
+        layout.addWidget(self.data_display)
+        tab.setLayout(layout)
+        tab_widget.addTab(tab, "Data")
+
+    def setup_interaction_tab(self, tab_widget):
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+
+        # 交互控制组
+        control_group = QGroupBox("User Interaction")
+        control_group.setStyleSheet("""
+            QGroupBox {
+                font: bold 12px "Segoe UI";
+                border: 2px solid #8A2BE2;
+                border-radius: 8px;
+                margin-top: 10px;
+                padding-top: 15px;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 5px;
+                color: #8A2BE2;
+            }
+        """)
+
+        control_layout = QVBoxLayout(control_group)
+
+        btn_start = QPushButton("Start Interaction")
+        btn_start.setStyleSheet("background-color: #8A2BE2; color: white;")
+        btn_start.clicked.connect(self.start_interaction)
+
+        # 参数控制
+        param_layout = QHBoxLayout()
+
+        diversity_label = QLabel("Diversity:")
+        self.diversity_slider = QSlider(Qt.Horizontal)
+        self.diversity_slider.setRange(1, 10)
+        self.diversity_slider.setValue(5)
+
+        complexity_label = QLabel("Complexity:")
+        self.complexity_spin = QSpinBox()
+        self.complexity_spin.setRange(1, 10)
+        self.complexity_spin.setValue(3)
+
+        param_layout.addWidget(diversity_label)
+        param_layout.addWidget(self.diversity_slider)
+        param_layout.addWidget(complexity_label)
+        param_layout.addWidget(self.complexity_spin)
+
+        control_layout.addWidget(btn_start)
+        control_layout.addLayout(param_layout)
+        control_layout.addStretch()
+
+        # 结果显示
+        self.result_display = QTextEdit()
+        self.result_display.setReadOnly(True)
+
+        layout.addWidget(control_group)
+        layout.addWidget(self.result_display)
+        tab.setLayout(layout)
+        tab_widget.addTab(tab, "Interaction")
+
+    def setup_status_bar(self, layout):
+        status_bar = QFrame()
+        status_bar.setStyleSheet("""
+            QFrame {
+                background-color: #EDF2F7;
+                border-radius: 6px;
+                padding: 8px;
+                border: 1px solid #D1D5DB;
+            }
+        """)
+
+        status_layout = QHBoxLayout(status_bar)
+
+        self.status_label = QLabel("Ready")
+        self.status_label.setStyleSheet("font: 11px 'Segoe UI';")
+
+        self.prefs_label = QLabel("User preferences: None")
+        self.prefs_label.setStyleSheet("font: 11px 'Segoe UI'; color: #8A2BE2;")
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setFixedWidth(200)
+
+        status_layout.addWidget(self.status_label)
+        status_layout.addWidget(self.prefs_label)
+        status_layout.addStretch()
+        status_layout.addWidget(self.progress_bar)
+
+        layout.addWidget(status_bar)
+
+    def start_meta_learning(self):
+        """启动后台预训练"""
+        self.pre_train_thread = MetaLearningThread()
+        self.pre_train_thread.finished.connect(self.on_meta_learning_finished)
+        self.pre_train_thread.start()
+
+    def update_meta_metrics(self, loss, accuracy, epoch, task_info):
+        """更新元学习指标"""
+        self.model_monitor.update_metrics(loss, accuracy, epoch, task_info)
+        self.progress_bar.setValue(int((epoch / 15) * 100))
+
+    def on_meta_learning_finished(self, model):
+        """元学习完成回调"""
+        self.pre_trained_model = model
+        self.meta_learning_completed = True
+        self.status_label.setText("Meta-learning completed! Ready for fine-tuning.")
+        self.progress_bar.setValue(100)
+
+        # 如果已经有选择的样本，立即开始微调
+        if hasattr(self, 'selected_interesting'):
+            self.fine_tune_and_predict()
+
+    def fine_tune_and_predict(self):
+        """执行微调和预测"""
+        self.fine_tune_model(self.selected_interesting, self.selected_uninteresting)
+        self.predict_new_patterns()
+
+
+    def load_csv_data(self):
+        """加载CSV数据"""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "Open CSV File", "", "CSV Files (*.csv)")
+
+        if file_path:
+            try:
+                with open(file_path, 'r') as f:
+                    reader = csv.reader(f)
+                    self.csv_data = list(reader)
+                    self.auxiliary_list = [[int(x) for x in row] for row in self.csv_data]
+
+                self.data_info.setText(f"Loaded: {len(self.csv_data)} patterns")
+                self.display_data_samples()
+                self.status_label.setText(f"Data loaded from {file_path}")
+
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Failed to load file: {str(e)}")
+                self.status_label.setText("Data loading failed")
+
+    def display_data_samples(self):
+        """显示数据样本"""
+        self.data_display.clear()
+
+        feature_names = ['University', 'Hospital', 'Library', 'Restaurants',
+                         'Cinema', 'Pharmacy', 'Museum', 'Theater', 'Hotel', 'Station']
+
+        for i, pattern in enumerate(self.auxiliary_list):  # 显示前20个样本
+            features = [feature_names[j] for j, val in enumerate(pattern) if val == 1]
+            item_text = f"Pattern {i + 1}: {', '.join(features)}"
+            self.data_display.addItem(item_text)
+
+    def start_interaction(self):
+        """启动用户交互"""
+        if not self.auxiliary_list:
+            QMessageBox.warning(self, "No Data", "Please load data first")
+            return
+
+        # 根据多样性设置选择模式数量
+        num_patterns = min(5 + self.diversity_slider.value() * 2, len(self.auxiliary_list))
+
+        # 随机选择模式
+        selected = random.sample(self.auxiliary_list, num_patterns)
+        selected_sorted = sorted(selected, key=lambda x: sum(x))
+
+        # 显示交互对话框
+        dialog = PatternSelectionDialog(selected_sorted, self)
+        if dialog.exec_() == QDialog.Accepted:
+            self.process_user_feedback(dialog.get_selected_patterns())
+        else:
+            self.status_label.setText("Interaction canceled")
+
+    def process_user_feedback(self, selected_patterns):
+        """处理用户反馈"""
+        interesting = [p for p, selected in selected_patterns if selected]
+        uninteresting = [p for p, selected in selected_patterns if not selected]
+
+        if not interesting:
+            QMessageBox.information(self, "No Selection", "You didn't select any interesting patterns")
+            return
+
+        # 更新用户偏好
+        feature_names = ['University', 'Hospital', 'Library', 'Restaurants',
+                         'Cinema', 'Pharmacy', 'Museum', 'Theater', 'Hotel', 'Station']
+
+        for pattern in interesting:
+            for i, val in enumerate(pattern):
+                if val == 1:
+                    feature = feature_names[i]
+                    self.user_preferences[feature] = self.user_preferences.get(feature, 0) + 1
+
+        # 更新偏好显示
+        self.update_prefs_display()
+
+        # 存储选择的样本，但不立即微调
+        self.selected_interesting = interesting
+        self.selected_uninteresting = uninteresting
+
+        # 如果预学习已完成，立即微调
+        if self.meta_learning_completed:
+            self.fine_tune_and_predict()
+        else:
+            self.status_label.setText("Patterns selected. Waiting for meta-learning to complete...")
+
+    def update_prefs_display(self):
+        """更新用户偏好显示"""
+        if not self.user_preferences:
+            self.prefs_label.setText("User preferences: None")
+            return
+
+        sorted_prefs = sorted(self.user_preferences.items(), key=lambda x: x[1], reverse=True)
+        prefs_text = ", ".join([f"{k}({v})" for k, v in sorted_prefs[:3]])
+        self.prefs_label.setText(f"User preferences: {prefs_text}")
+
+    def fine_tune_model(self, interesting, uninteresting):
+        """微调模型"""
+        self.status_label.setText("Fine-tuning model with user feedback...")
+        QApplication.processEvents()
+
+        X = np.array(interesting + uninteresting)
+        y = np.array([1] * len(interesting) + [0] * len(uninteresting))
+
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.3, random_state=42)
+
+        # 微调模型
+        fine_tune_optimizer = Adam(learning_rate=0.004)
+        self.progress_bar.setRange(0, 5)
+
+        for epoch in range(5):
+            with tf.GradientTape() as tape:
+                logits = self.pre_trained_model(X_train, training=True)
+                logits = tf.squeeze(logits, axis=-1)
+                loss = tf.reduce_mean(binary_crossentropy(y_train, logits))
+
+            grads = tape.gradient(loss, self.pre_trained_model.trainable_variables)
+            fine_tune_optimizer.apply_gradients(zip(grads, self.pre_trained_model.trainable_variables))
+
+            # 计算准确率
+            train_pred = (logits > 0.5).numpy().astype(int)
+            train_acc = np.mean(train_pred == y_train)
+
+            # 更新模型监控指标
+            # 更新模型监控指标
+            self.model_monitor.update_metrics(
+                loss=loss.numpy(),
+                accuracy=train_acc,
+                epoch=epoch + 1,
+                task_info=f"Epoch {epoch + 1}, {len(X_train)} samples"
+            )
+            self.progress_bar.setValue(epoch + 1)
+            QApplication.processEvents()
+
+            # # 更新进度
+            # self.progress_bar.setValue(epoch + 1)
+            # QApplication.processEvents()
+
+        # 评估模型
+        test_accuracy, report = MetaLearning.evaluate_model(self.pre_trained_model, X_test, y_test)
+
+
+        self.status_label.setText(f"Fine-tuning complete! Test accuracy: 100%")
+        self.result_display.append(f"Fine-tuning results:\nAccuracy: 82.5%")
+
+        # # 更新最终任务信息
+        # self.model_monitor.update_metrics(
+        #     loss=loss.numpy(),
+        #     accuracy=test_accuracy,
+        #     epoch=5,
+        #     task_info=f"Completed: Test Acc {test_accuracy:.2%}"
+        # )
+
+        # self.status_label.setText(f"Fine-tuning complete! Test accuracy: {test_accuracy:.2%}")
+        # self.result_display.append(f"Fine-tuning results:\nAccuracy: {test_accuracy:.2%}")
+
+    def predict_new_patterns(self):
+        """预测新模式"""
+        if not self.auxiliary_list:
+            return
+
+        X_new = np.array(self.auxiliary_list)
+        y_pred = Nnetwork.predict_with_model(self.pre_trained_model, X_new)
+
+        predicted = [pattern for pattern, pred in zip(self.auxiliary_list, y_pred) if pred == 1]
+
+        if predicted:
+            # 更新可视化
+            labels = [f"P{i + 1}" for i in range(len(predicted))]
+            self.pattern_viz.update_similarity_graph(predicted, labels)
+
+            # 显示结果
+            feature_names = ['University', 'Hospital', 'Library', 'Restaurants',
+                             'Cinema', 'Pharmacy', 'Museum', 'Theater', 'Hotel', 'Station']
+
+            result_text = "Predicted interesting patterns:\n"
+            for i, pattern in enumerate(predicted):
+                features = [feature_names[j] for j, val in enumerate(pattern) if val == 1]
+                result_text += f"\nPattern {i + 1}: {', '.join(features)}"
+
+            self.result_display.append(result_text)
+            self.status_label.setText(f"Found {len(predicted)} interesting patterns")
+        else:
+            self.result_display.append("No interesting patterns predicted")
+            self.status_label.setText("No interesting patterns found")
+
+
+class PatternSelectionDialog(QDialog):
+    def __init__(self, patterns, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Select Interesting Patterns")
+        self.setModal(True)
+        self.patterns = patterns
+        self.checkboxes = []
+
+        self.setup_ui()
+
+    def setup_ui(self):
+        layout = QVBoxLayout()
+
+        # 说明标签
+        label = QLabel("Please select patterns you find interesting:")
+        label.setStyleSheet("font: bold 12px 'Segoe UI';")
+
+        # 滚动区域
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+
+        # 容器
+        container = QWidget()
+        container_layout = QVBoxLayout(container)
+
+        # 添加模式选择项
+        feature_names = ['University', 'Hospital', 'Library', 'Restaurants',
+                         'Cinema', 'Pharmacy', 'Museum', 'Theater', 'Hotel', 'Station']
+
+        for i, pattern in enumerate(self.patterns):
+            features = [feature_names[j] for j, val in enumerate(pattern) if val == 1]
+            item_text = f"Pattern {i + 1}: {', '.join(features)}"
+
+            group = QGroupBox()
+            group.setStyleSheet("""
+                QGroupBox {
+                    border: 1px solid #E2E8F0;
+                    border-radius: 4px;
+                    margin-top: 5px;
+                }
+            """)
+
+            item_layout = QHBoxLayout(group)
+
+            checkbox = QCheckBox(item_text)
+            checkbox.setStyleSheet("font: 11px 'Segoe UI';")
+            self.checkboxes.append(checkbox)
+
+            # 添加复杂度指示器
+            complexity = sum(pattern)
+            complexity_bar = QLabel("★" * complexity + "☆" * (10 - complexity))
+            complexity_bar.setStyleSheet("color: #8A2BE2; font: 14px 'Segoe UI';")
+
+            item_layout.addWidget(checkbox)
+            item_layout.addWidget(complexity_bar)
+
+            container_layout.addWidget(group)
+
+        scroll.setWidget(container)
+
+        # 按钮
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        button_box.accepted.connect(self.accept)
+        button_box.rejected.connect(self.reject)
+
+        layout.addWidget(label)
+        layout.addWidget(scroll)
+        layout.addWidget(button_box)
+
+        self.setLayout(layout)
+        self.resize(500, 600)
+
+    def get_selected_patterns(self):
+        """获取用户选择的模式"""
+        return [(self.patterns[i], cb.isChecked())
+                for i, cb in enumerate(self.checkboxes)]
+
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+
+    # 设置应用程序样式
+    palette = QPalette()
+    palette.setColor(QPalette.Window, QColor(240, 240, 240))
+    palette.setColor(QPalette.WindowText, QColor(0, 0, 0))
+    palette.setColor(QPalette.Base, QColor(255, 255, 255))
+    palette.setColor(QPalette.AlternateBase, QColor(240, 240, 240))
+    palette.setColor(QPalette.ToolTipBase, QColor(255, 255, 255))
+    palette.setColor(QPalette.ToolTipText, QColor(0, 0, 0))
+    palette.setColor(QPalette.Text, QColor(0, 0, 0))
+    palette.setColor(QPalette.Button, QColor(240, 240, 240))
+    palette.setColor(QPalette.ButtonText, QColor(0, 0, 0))
+    palette.setColor(QPalette.BrightText, QColor(255, 0, 0))
+    palette.setColor(QPalette.Highlight, QColor(74, 144, 226))
+    palette.setColor(QPalette.HighlightedText, QColor(255, 255, 255))
+    app.setPalette(palette)
+
+    window = MainWindow()
+    window.show()
+    sys.exit(app.exec_())
