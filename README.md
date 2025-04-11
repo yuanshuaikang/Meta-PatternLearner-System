@@ -30,7 +30,7 @@ pip install -r requirements.txt
 
 ### Data Preparation
 
-In this demo, we input the distribution of urban facilities into the system as feature vectors.
+In this demonstration, the distribution of urban facilities is encoded as feature vectors and fed into the system.
 
 Prepare your pattern data in the following format:
 ```python
