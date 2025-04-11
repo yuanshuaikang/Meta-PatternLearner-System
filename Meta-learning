@@ -1,0 +1,188 @@
+import numpy as np
+import tensorflow as tf
+from sklearn.metrics import accuracy_score, classification_report
+from tensorflow.keras import Sequential
+from tensorflow.keras.layers import Dense
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.layers import Input
+from tensorflow.keras.losses import binary_crossentropy
+
+
+class MetaLearning:
+    @staticmethod
+    def load_data(pattern_data):
+        # 将 interesting 和 uninteresting 数组合并为特征 X
+        X = np.array(pattern_data["interesting"] + pattern_data["uninteresting"])
+
+        # 生成标签 y
+        # interesting 对应标签 1，uninteresting 对应标签 -1
+        y = np.array([1] * len(pattern_data["interesting"]) + [-1] * len(pattern_data["uninteresting"]))
+        return X, y
+
+    @staticmethod
+    def generate_meta_tasks(X, y, num_tasks=5, n_shot=5, n_query=15, k_way=2):
+        meta_tasks = []
+        classes = np.unique(y)  # 获取所有类别
+        if len(classes) < k_way:
+            raise ValueError(f"数据中类别数不足 {k_way} 个")
+
+        X = np.array(X)  # 将 X 转换为 numpy 数组
+        y = np.array(y)  # 将 y 转换为 numpy 数组
+
+        for _ in range(num_tasks):
+            # 随机选择 k_way 个类别
+            selected_classes = np.random.choice(classes, k_way, replace=False)
+
+            support_X, support_y = [], []
+            query_X, query_y = [], []
+
+            for cls in selected_classes:
+                # 获取当前类别的样本索引
+                cls_indices = np.where(y == cls)[0]
+                if len(cls_indices) < n_shot + n_query:
+                    raise ValueError(f"类别 {cls} 的样本数不足 {n_shot + n_query} 个")
+
+                # 随机选择 n_shot + n_query 个样本
+                selected = np.random.choice(cls_indices, n_shot + n_query, replace=False)
+                support = selected[:n_shot]  # 支持集
+                query = selected[n_shot:]  # 查询集
+
+                # 添加到任务
+                support_X.append(X[support])
+                support_y.append(y[support])
+                query_X.append(X[query])
+                query_y.append(y[query])
+
+            # 合并并打乱顺序
+            support_X = np.concatenate(support_X)
+            support_y = np.concatenate(support_y)
+            query_X = np.concatenate(query_X)
+            query_y = np.concatenate(query_y)
+
+            # 打乱顺序
+            support_shuffle = np.random.permutation(len(support_X))
+            query_shuffle = np.random.permutation(len(query_X))
+
+            meta_tasks.append((
+                support_X[support_shuffle],
+                support_y[support_shuffle],
+                query_X[query_shuffle],
+                query_y[query_shuffle]
+            ))
+
+        return meta_tasks
+
+    class MetaModelWrapper:
+        def __init__(self, input_dim, hidden_units=64):
+            self.meta_model = self.build_meta_model(input_dim, hidden_units)
+
+        def build_meta_model(self, input_dim, hidden_units):
+            model = Sequential([
+                Input(shape=(input_dim,)),
+                Dense(hidden_units, activation='relu'),
+                Dense(hidden_units, activation='relu'),
+                Dense(1, activation='sigmoid')  # 输出层改为一个节点
+            ])
+            return model
+
+        def get_weights(self):
+            return self.meta_model.get_weights()
+
+        def set_weights(self, weights):
+            self.meta_model.set_weights(weights)
+
+        def __call__(self, inputs, training=False):
+            return self.meta_model(inputs, training=training)
+
+        @property
+        def trainable_variables(self):
+            """返回模型的可训练参数"""
+            return self.meta_model.trainable_variables
+
+    @staticmethod
+    def train_on_batch(meta_model, task_data, inner_optimizer, inner_steps, outer_optimizer=None):
+        support_X, support_y, query_X, query_y = task_data
+        # 在 train_on_batch 中转换标签值
+        support_y = np.where(support_y == -1, 0, support_y)
+        query_y = np.where(query_y == -1, 0, query_y)
+
+        # 将 target 调整为二维
+        support_y = np.expand_dims(support_y, axis=-1)
+        query_y = np.expand_dims(query_y, axis=-1)
+
+        # 保存元模型的初始权重
+        initial_weights = meta_model.get_weights()
+
+        # 内循环：在支持集上更新模型参数
+        for _ in range(inner_steps):
+            with tf.GradientTape() as tape:
+                logits = meta_model(support_X, training=True)
+                loss = tf.reduce_mean(binary_crossentropy(support_y, logits))
+            grads = tape.gradient(loss, meta_model.trainable_variables)
+            inner_optimizer.apply_gradients(zip(grads, meta_model.trainable_variables))
+
+        # 在查询集上计算损失和准确率
+        with tf.GradientTape() as tape:
+            logits = meta_model(query_X, training=True)
+            loss = tf.reduce_mean(binary_crossentropy(query_y, logits))
+            acc = tf.reduce_mean(tf.cast((logits > 0.5) == query_y, tf.float32))
+
+        # 恢复元模型的初始权重
+        meta_model.set_weights(initial_weights)
+
+        return loss.numpy(), acc.numpy(), tape.gradient(loss, meta_model.trainable_variables)
+
+    @staticmethod
+    def maml_train(meta_model, X_scaled, y, num_tasks=5, n_shot=5, n_query=15, k_way=2,
+                   inner_optimizer=Adam(0.01),
+                   outer_optimizer=Adam(0.001),
+                   epochs=50,
+                   inner_steps=5):
+        for epoch in range(epochs):
+            meta_tasks = MetaLearning.generate_meta_tasks(X_scaled, y, num_tasks, n_shot, n_query, k_way)
+            total_loss = 0
+            total_acc = 0
+            total_grads = [tf.zeros_like(w) for w in meta_model.trainable_variables]  # 初始化外部梯度
+
+            # 每个epoch打乱任务顺序
+            np.random.shuffle(meta_tasks)
+
+            for task in meta_tasks:
+                # 解包任务数据
+                support_X, support_y, query_X, query_y = task
+
+                # 转换数据类型（与原始代码兼容）
+                support_y = np.where(support_y == -1, 0, support_y)
+                query_y = np.where(query_y == -1, 0, query_y)
+
+                # 执行MAML训练步骤
+                loss, acc, grads = MetaLearning.train_on_batch(
+                    meta_model,
+                    (support_X, support_y, query_X, query_y),
+                    inner_optimizer,
+                    inner_steps
+                )
+
+                total_loss += loss
+                total_acc += acc
+
+                for i, grad in enumerate(grads):
+                    total_grads[i] += grad
+
+            # 在所有任务上统一更新外部权重
+            outer_optimizer.apply_gradients(zip(total_grads, meta_model.trainable_variables))
+
+            # 输出统计信息
+            avg_loss = total_loss / len(meta_tasks)
+            avg_acc = total_acc / len(meta_tasks)
+            print(f"Epoch {epoch + 1}/{epochs} | Loss: {avg_loss:.4f} | Acc: {avg_acc:.4f}")
+
+    @staticmethod
+    def evaluate_model(model, X_test, y_test):
+        # 将标签 -1 转换为 0
+        y_test = np.where(y_test == -1, 0, y_test)
+        y_pred = (model.predict(X_test) > 0.5).astype(int)  # 将概率转换为类别
+
+        accuracy = accuracy_score(y_test, y_pred)
+        report = classification_report(y_test, y_pred)
+        return accuracy, report
