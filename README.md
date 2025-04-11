@@ -29,8 +29,12 @@ pip install -r requirements.txt
 ## Usage
 
 ### Data Preparation
+
+In this demo, we input the distribution of urban facilities into the system as feature vectors.
+
 Prepare your pattern data in the following format:
 ```python
+feature = ['University', 'Hospital', 'Library', 'Restaurants', 'Cinema', 'Pharmacy', 'Museum', 'Theater', 'Hotel', 'Station']
 pattern_data = {
     "interesting": [
         [1, 0, 1, 0, 1, 0, 1, 0, 1, 0],  # Example pattern 1
